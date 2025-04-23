@@ -1,0 +1,201 @@
+(*******************************************************************
+ * 0. 全局声明
+ *******************************************************************)
+
+(* --- 原子类型和函数声明 --- *)
+
+type cmdType.
+type nonceType.
+type logType.
+
+
+(* PSK 作为所有方共享的预共享密钥；用 [private] 表示其不直接可被攻击者获知 *)
+free PSK : bitstring [private].
+
+free timeToken:bitstring.
+(* 声明 HMAC 函数；简化为 hmac(m, key) => bitstring *)
+fun hmac(bitstring, bitstring): bitstring.
+
+(* 用于将两个 bitstring 拼接在一起的函数（也可嵌套使用），模拟 “|” 或 pair(...) *)
+fun pair(bitstring, bitstring): bitstring [private].
+fun bitstring_of_nonce(nonceType) : bitstring [private].
+fun bitstring_to_nonce(bitstring) : nonceType [private].
+
+fun bitstring_of_cmd(cmdType) : bitstring.
+fun bitstring_to_cmd(bitstring) : cmdType.
+fun bitstring_of_log(logType) : bitstring.
+fun bitstring_to_log(bitstring) : logType.
+
+
+(* 投影函数：从 pair 中提取第一个和第二个组件 *)
+fun proj1(bitstring): bitstring [private].
+fun proj2(bitstring): bitstring [private].
+
+(* 定义投影函数的行为 *)
+equation forall x:bitstring,y:bitstring;
+    proj1(pair(x, y)) = x.
+equation forall x:bitstring,y:bitstring;
+    proj2(pair(x, y)) = y.
+
+
+(* 声明若干常量或名称，可根据需要增补 *)
+
+
+(*******************************************************************
+ * 1. 信道定义
+ *******************************************************************)
+(* 说明：根据安全需求，可以将这些信道都声明为公共（让攻击者可访问），也可有些声明为 private *)
+
+free cSG : channel.        (* Server <-> Gateway 通道 *)
+free cGL : channel.        (* Gateway <-> Lock 通道 *)
+free cAttacker : channel.  (* 攻击者可用的公共通道，用于模拟Dolev-Yao模型下的监听/注入 *)
+
+(*******************************************************************
+ * 2. 事件声明
+ *******************************************************************)
+(* 用于验证命令认证、时间同步等行为的事件 *)
+event ServerSendsAuthorization(bitstring).
+event GatewayAcceptsAuthorization(bitstring).
+
+
+
+event TimeSent(bitstring).
+event TimeUpdated(bitstring).
+event ServerSendsCmd(cmdType, nonceType).
+event LockExecCmd(cmdType, nonceType).
+event LoggingSent(logType).
+event ActionLogged(logType).
+event LoggingConfirmed(logType).
+
+query attacker(PSK).
+query ctime:bitstring; event(TimeUpdated(ctime)) ==> event(TimeSent(ctime)).
+query cmd:cmdType,n:nonceType; event(LockExecCmd(cmd, n)) ==> event(ServerSendsCmd(cmd, n)).
+query log:logType; event(LoggingConfirmed(log)) ==> event(LoggingSent(log)).
+query ctime:bitstring; inj-event(TimeUpdated(ctime)) ==> inj-event(TimeSent(ctime)).
+query cmd:cmdType,n:nonceType; inj-event(LockExecCmd(cmd, n)) ==> inj-event(ServerSendsCmd(cmd, n)).
+query log:logType; inj-event(LoggingConfirmed(log)) ==> inj-event(LoggingSent(log)).
+(*******************************************************************
+ * 3. 各参与方进程
+ *******************************************************************)
+
+(************ 3.1 服务器进程 (Server) ************)
+let ServerProcess() =
+    in(cSG, time_nonce:nonceType);
+    new ctime : bitstring;
+    let tsign = hmac(PSK,pair(ctime,bitstring_of_nonce(time_nonce))) in
+        let time_callback = pair(ctime, tsign) in
+            event TimeSent(ctime);
+            out(cSG, time_callback);
+            
+    
+    (* 服务器生成 exp_time = current_time + grant_time *)
+    let exp_time = timeToken in
+    (* 服务器计算 T_k = pair(exp_time, hmac(PSK, exp_time)) *)
+        let t_k = pair( exp_time, hmac(PSK, timeToken) ) in
+
+        (* 服务器发送授权给网关，并记录事件 *)
+        out(cSG, t_k);
+        event ServerSendsAuthorization(timeToken);
+
+    in(cGL, logging:bitstring);
+    let log = bitstring_to_log(proj1(logging)) in
+        let logging_nonce = bitstring_to_nonce(proj2(logging)) in
+            let callback = hmac(PSK, bitstring_of_nonce(logging_nonce)) in
+                out(cSG, callback);
+                event ActionLogged(log).
+
+
+
+
+(************ 3.2 网关进程 (Gateway) ************)
+let GatewayProcess() =
+    (* 从服务器接收 T_k = pair(exp_time, hmac(PSK, exp_time)) *)
+    in(cGL, time_nonce:nonceType);
+    out(cSG, time_nonce);
+    in(cSG, time_callback:bitstring);
+    out(cGL, time_callback);
+
+    in(cSG, t_k:bitstring);
+    let exp_timeG = proj1(t_k) in
+    let hmac_server = proj2(t_k) in
+
+    (* 验证 T_k 中的 HMAC 是否正确，以及 exp_time 是否 > current_time *)
+    let current_timeG = timeToken in
+       if exp_timeG = current_timeG then
+         event GatewayAcceptsAuthorization(exp_timeG);
+        
+
+
+    (* 网关生成执行命令 A_k = pair(cmd, pair(t_k, hmac(t_k, pair(nonce, cmd)))) 等 *)
+
+    new testCmd : cmdType;
+    in(cGL, n_cmd:nonceType);
+    let hmac_Ak = hmac(proj2(t_k), pair(bitstring_of_nonce(n_cmd), bitstring_of_cmd(testCmd))) in
+    let A_k = pair(bitstring_of_cmd(testCmd), 
+                   pair(t_k, hmac_Ak)) in
+
+    (* 将 A_k 发给 Lock *)
+    out(cGL, A_k);
+    event ServerSendsCmd(testCmd, n_cmd);  (* 这里可替换成 GatewaySendsCmd 事件，视你需求 *)
+    in(cGL, logging:bitstring);
+    out(cSG,logging);
+    in(cSG,callback:bitstring);
+    out(cGL, callback);
+    0.
+
+
+(************ 3.3 智能锁进程 (Lock) ************)
+let LockProcess() =
+    new time_nonce : nonceType;
+    out(cGL, time_nonce);
+    in(cGL, time_callback:bitstring);
+    let ctime = proj1(time_callback) in
+        let tsign = proj2(time_callback) in
+            if tsign = hmac(PSK,pair(ctime,bitstring_of_nonce(time_nonce))) then
+                event TimeUpdated(ctime);
+
+    new session_nonce : nonceType;
+    (* 从网关接收命令 A_k = pair(cmd, pair(t_k, hmac_Ak)) *)
+    out(cGL, session_nonce);
+    in(cGL, A_k:bitstring);
+
+    let cmdVal = proj1(A_k) in
+    let t_kVal = proj1(proj2(A_k)) in
+    let hmac_AkVal = proj2(proj2(A_k)) in
+
+    (* 解析 t_kVal = pair(exp_time, hmac_serverExp) *)
+    let exp_timeL = proj1(t_kVal) in
+    let hmac_serverExp = proj2(t_kVal) in
+
+    (* 验证 1) exp_time > lock当前时间 2) hmac_serverExp 是否与 hmac(PSK, exp_time) 一致 *)
+    let current_timeL = timeToken in
+    if exp_timeL = current_timeL then
+       if hmac_serverExp = hmac(PSK, exp_timeL) then
+       (
+         (* 验证 3) hmac_AkVal = hmac( t_kVal, pair(nonce, cmd) ) 
+            需要先提取 nonce, 但此处为了简化，假设命令里自带nonce或者用新方式对齐
+            可参见伪代码中的 HMAC(T_k, nonce|cmd) 
+         *)
+         if hmac_AkVal = hmac(t_kVal, pair(bitstring_of_nonce(session_nonce), cmdVal)) then
+            (  (* 通过所有验证，执行命令 *)
+              event LockExecCmd(bitstring_to_cmd(cmdVal), session_nonce); 
+              new logging_nonce : nonceType;
+              new logging : logType;
+              out(cGL, pair(bitstring_of_log(logging), bitstring_of_nonce(logging_nonce)));
+              in(cGL,callback:bitstring);
+              if hmac(PSK, bitstring_of_nonce(logging_nonce)) = callback then
+                event LoggingConfirmed(logging)
+            )
+       ).
+
+              
+
+
+(*******************************************************************
+ * 4. 主进程组合
+ *******************************************************************)
+process 
+    (!ServerProcess) 
+  | (!GatewayProcess) 
+  | (!LockProcess)
+
